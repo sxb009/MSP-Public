@@ -27,7 +27,6 @@ sudo ufw default deny incoming
 sudo ufw default allow outgoing
 # Allow standard SSH just in case you need local network access
 sudo ufw allow ssh 
-# Allow all traffic across the secure Tailscale VPN mesh
 sudo ufw allow in on tailscale0
 # Turn the firewall on
 sudo ufw --force enable
