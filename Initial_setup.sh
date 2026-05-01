@@ -13,7 +13,7 @@ sudo sh get-docker.sh
 # 3. Add your current user to the Docker group (eliminates needing 'sudo' for docker commands)
 sudo usermod -aG docker $USER
 
-# 4. Configure Docker to start automatically after a factory power outage
+# 4. Configure Docker to start automatically after power outage
 sudo systemctl enable docker.service
 sudo systemctl enable containerd.service
 
@@ -27,7 +27,6 @@ sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow ssh 
 sudo ufw allow in on tailscale0
-# Turn the firewall on
 sudo ufw --force enable
 
 echo "Base provisioning complete! Please reboot the server to apply user group changes."
