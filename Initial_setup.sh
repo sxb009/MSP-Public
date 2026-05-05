@@ -57,11 +57,9 @@ sudo sysctl -w net.ipv4.ip_forward=1
 if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
     echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
 fi
-
 # The Missing Link: Allow Docker to route traffic out through Tailscale
 sudo ufw route allow in on docker0 out on tailscale0
 sudo ufw route allow in on tailscale0 out on docker0
-
 sudo ufw --force enable
 
 # --- 7. Docker Log Rotation (SSD Protection) ---
