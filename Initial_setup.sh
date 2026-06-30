@@ -7,7 +7,8 @@
 # PURPOSE:
 #   Takes a blank Ubuntu PC and makes it a secure, deployment-ready edge node.
 #   Installs Docker, Tailscale, UFW, Docker network security, the MudroLogic
-#   maintenance user, and the Portainer Edge Agent.
+#   maintenance user, deploys the SSH access key, hardens SSH, and installs
+#   the Portainer Edge Agent.
 #
 #   This script stops here. The full Docker stack (Node-RED, TimescaleDB, etc.)
 #   is deployed separately via Portainer pulling from the private GitHub repo.
@@ -56,7 +57,7 @@ echo ""
 # ==============================================================================
 # 1. UPDATE OPERATING SYSTEM
 # ==============================================================================
-echo "[1/9] Updating operating system..."
+echo "[1/11] Updating operating system..."
 
 sudo -E apt-get update -q
 sudo -E apt-get upgrade -y \
@@ -76,7 +77,7 @@ echo "      OS update complete."
 # ==============================================================================
 # 2. INSTALL DOCKER ENGINE AND COMPOSE PLUGIN
 # ==============================================================================
-echo "[2/9] Installing Docker Engine and Compose plugin..."
+echo "[2/11] Installing Docker Engine and Compose plugin..."
 
 # Uses the official Docker convenience script — installs Docker Engine,
 # containerd, and the CLI. Never use the Snap version of Docker — it causes
@@ -95,7 +96,7 @@ echo "      Docker installed."
 # ==============================================================================
 # 3. FIX DOCKER PERMISSIONS
 # ==============================================================================
-echo "[3/9] Configuring Docker permissions for: ${ACTUAL_USER}..."
+echo "[3/11] Configuring Docker permissions for: ${ACTUAL_USER}..."
 
 # Add the actual user (not root) to the docker group.
 # Without this, every docker command requires sudo after reboot.
@@ -108,7 +109,7 @@ echo "      Permissions configured."
 # ==============================================================================
 # 4. ENABLE DOCKER AUTOSTART
 # ==============================================================================
-echo "[4/9] Enabling Docker autostart on boot..."
+echo "[4/11] Enabling Docker autostart on boot..."
 
 # Critical for edge devices — stack must survive power outages automatically.
 # Without this, a client power cut means the entire system stays down until
@@ -122,7 +123,7 @@ echo "      Autostart enabled."
 # ==============================================================================
 # 5. DOCKER LOG ROTATION (SSD PROTECTION)
 # ==============================================================================
-echo "[5/9] Configuring Docker log rotation..."
+echo "[5/11] Configuring Docker log rotation..."
 
 # Without this, Docker logs grow unbounded and fill the SSD on long-running
 # edge devices. 10MB per file, 3 files = 30MB maximum total log storage.
@@ -144,7 +145,7 @@ echo "      Log rotation configured (10MB x 3 files)."
 # ==============================================================================
 # 6. INSTALL AND AUTHENTICATE TAILSCALE
 # ==============================================================================
-echo "[6/9] Installing Tailscale VPN..."
+echo "[6/11] Installing Tailscale VPN..."
 
 curl -fsSL https://tailscale.com/install.sh | sh
 
@@ -178,7 +179,7 @@ echo ""
 # ==============================================================================
 # 7. FIREWALL AND NETWORK SECURITY
 # ==============================================================================
-echo "[7/9] Configuring firewall and network security..."
+echo "[7/11] Configuring firewall and network security..."
 
 # --- UFW BASELINE ---
 # Default deny all incoming. Only Tailscale traffic and SSH are allowed.
@@ -254,7 +255,7 @@ echo "      (Grafana on 0.0.0.0:3000 is accessible on factory LAN — intentiona
 # ==============================================================================
 # 8. CREATE MUDROLOGIC MAINTENANCE USER
 # ==============================================================================
-echo "[8/9] Creating maintenance user..."
+echo "[8/11] Creating maintenance user..."
 
 # A dedicated maintenance account ensures you always have access to this machine
 # even if the client changes the default Ubuntu user password, or the original
@@ -297,9 +298,44 @@ fi
 
 
 # ==============================================================================
-# 9. INSTALL PORTAINER EDGE AGENT
+# 9. DEPLOY MUDROLOGIC SSH PUBLIC KEY
 # ==============================================================================
-echo "[9/9] Installing Portainer Edge Agent..."
+echo "[9/11] Deploying SSH access key for mudro-admin..."
+
+# Ensures MudroLogic can always SSH into this device as mudro-admin via key-based
+# auth. The public key below is safe to store in a public repo — only the
+# matching private key (kept securely by MudroLogic) can authenticate.
+sudo mkdir -p /home/mudro-admin/.ssh
+sudo chmod 700 /home/mudro-admin/.ssh
+
+# Your SSH public key — safe to be in a public repo, this is NOT a secret
+sudo bash -c 'echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... maintenance@mudrologic.com" >> /home/mudro-admin/.ssh/authorized_keys'
+
+sudo chmod 600 /home/mudro-admin/.ssh/authorized_keys
+sudo chown -R mudro-admin:mudro-admin /home/mudro-admin/.ssh
+
+echo "      SSH key deployed."
+
+
+# ==============================================================================
+# 10. HARDEN SSH CONFIGURATION
+# ==============================================================================
+echo "[10/11] Hardening SSH configuration..."
+
+# Disables password-based login and root login over SSH.
+# After this point, only key-based authentication is accepted.
+# This prevents brute-force attacks even if a weak password exists.
+sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sudo systemctl restart sshd
+
+echo "      SSH hardened. Key-only access enforced."
+
+
+# ==============================================================================
+# 11. INSTALL PORTAINER EDGE AGENT
+# ==============================================================================
+echo "[11/11] Installing Portainer Edge Agent..."
 
 # The Edge Agent registers this PC with your central Portainer dashboard.
 # Once running, you deploy and manage the full Docker stack remotely via Portainer.
