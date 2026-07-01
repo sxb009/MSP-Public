@@ -391,6 +391,18 @@ echo "      Portainer Edge Agent installed."
 unset TS_KEY ADMIN_PASSWORD PORTAINER_CMD TAILSCALE_IP
 
 
+# Create bind-mount dirs with correct ownership before Portainer deploys
+mkdir -p ./node-red/data
+sudo chown -R 1000:1000 ./node-red/data       # node-red runs as UID 1000
+ 
+# Mosquitto runtime dirs (already bind-mounted in compose)
+mkdir -p ./mosquitto/data ./mosquitto/log
+sudo chown -R 1883:1883 ./mosquitto/data ./mosquitto/log
+ 
+# Host backup directory (used by rclone backup service)
+sudo mkdir -p /backups
+
+
 # ==============================================================================
 # COMPLETION
 # ==============================================================================
