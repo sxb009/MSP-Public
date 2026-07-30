@@ -21,11 +21,39 @@
 #   - No secrets are written to disk or bash history
 #
 # USAGE:
-#   wget https://raw.githubusercontent.com/YOUR_USERNAME/mudrologic-edge-bootstrap/main/Initial_setup.sh
+#   wget https://raw.githubusercontent.com/sxb009/MSP-Public/main/Initial_setup.sh
 #   cat Initial_setup.sh          # Always verify before running
 #   chmod +x Initial_setup.sh
 #   sudo ./Initial_setup.sh
 # ==============================================================================
+
+
+# ==============================================================================
+# CONFIGURATION — REVIEW BEFORE EVERY DEPLOYMENT
+# ==============================================================================
+
+# MudroLogic maintenance SSH public key.
+# This is a PUBLIC key and is safe in a public repo — only the matching private
+# key can authenticate. It MUST be the real key: the script refuses to run with
+# the placeholder, because a malformed entry in authorized_keys fails silently
+# and you would only discover it when you needed emergency access.
+MUDRO_SSH_PUBKEY="REPLACE_WITH_REAL_ED25519_PUBLIC_KEY"
+
+# Should Grafana (port 3000) be reachable from the factory LAN?
+#   true  — factory floor staff can open dashboards without Tailscale.
+#           Grafana's login page is then exposed to every device on the LAN.
+#   false — Grafana is reachable only over Tailscale, like every other service.
+#
+# This must be set deliberately. The previous version of this script claimed
+# LAN access was enabled while the firewall rules actually blocked it.
+GRAFANA_LAN_ACCESS=true
+GRAFANA_PORT=3000
+
+# Directory Portainer deploys the stack into — the compose file uses relative
+# bind mounts (./init, ./mosquitto/config, ./telegraf, ./grafana, ./node-red),
+# so those paths must exist there with the right ownership.
+# Verify this against your Portainer stack path; the default is only a guess.
+STACK_DIR="${STACK_DIR:-/opt/mudrologic}"
 
 
 # ==============================================================================
@@ -44,6 +72,26 @@ ACTUAL_USER=${SUDO_USER:-$USER}
 # Detect the primary external network interface (eth0, ens33, enp3s0, etc.)
 # Used to configure DOCKER-USER iptables rules correctly regardless of hardware.
 EXTERNAL_IF=$(ip route | grep default | awk '{print $5}' | head -1)
+
+# --- PREFLIGHT ---------------------------------------------------------------
+# Fail before touching the system rather than half-way through.
+
+if [ -z "${EXTERNAL_IF}" ]; then
+    echo "ERROR: could not detect the default network interface." >&2
+    echo "       The DOCKER-USER firewall rules depend on it. Aborting." >&2
+    exit 1
+fi
+
+# Reject the placeholder key. Writing it would produce an authorized_keys entry
+# that never authenticates, leaving you locked out of your own maintenance account.
+if [ "${MUDRO_SSH_PUBKEY}" = "REPLACE_WITH_REAL_ED25519_PUBLIC_KEY" ] \
+   || [ -z "${MUDRO_SSH_PUBKEY}" ] \
+   || case "${MUDRO_SSH_PUBKEY}" in *"..."*) true ;; *) false ;; esac; then
+    echo "ERROR: MUDRO_SSH_PUBKEY is not set to a real public key." >&2
+    echo "       Edit the CONFIGURATION block at the top of this script." >&2
+    echo "       Get it with:  cat ~/.ssh/id_ed25519.pub" >&2
+    exit 1
+fi
 
 echo ""
 echo "=============================================="
@@ -155,14 +203,25 @@ echo "      Get a one-time auth key from: tailscale.com/admin → Settings → A
 echo "      The key will not be shown on screen as you type."
 echo ""
 
-# read -sp: silent prompt — key is never displayed or written to terminal
-# The key is passed directly as an environment variable, never stored in a file
-# or written to bash history. Unset immediately after use.
-read -sp "      Tailscale Auth Key: " TS_KEY
+# read -srp: silent prompt — key is never displayed or written to terminal.
+# -r prevents backslashes in the key from being mangled.
+# The key is passed as a command-line flag, never stored in a file or written
+# to bash history. Unset immediately after use.
+read -srp "      Tailscale Auth Key: " TS_KEY
 echo ""
 
+if [ -z "${TS_KEY}" ]; then
+    echo "ERROR: no auth key entered. Aborting." >&2
+    exit 1
+fi
+
 echo "      Authenticating..."
-sudo TAILSCALE_AUTHKEY="${TS_KEY}" tailscale up --accept-routes
+# NOTE: 'tailscale up' takes --auth-key as a FLAG. There is no TAILSCALE_AUTHKEY
+# environment variable — the previous version set one, which tailscale ignored
+# (and which sudo stripped anyway), so the key was silently discarded and the
+# command fell back to interactive browser auth. That is a dead end on a
+# headless edge device.
+sudo tailscale up --auth-key="${TS_KEY}" --accept-routes
 unset TS_KEY
 
 # Verify Tailscale connected and get the assigned IP for later use
@@ -225,20 +284,51 @@ sudo ufw --force enable
 # This makes every container effectively Tailscale-only at the network level,
 # regardless of what bind IP individual containers use.
 #
-# Exception: Grafana (0.0.0.0:3000) is intentionally exposed on the LAN
-# so factory floor staff can view dashboards without Tailscale.
-# If this is not needed, keep Grafana on 127.0.0.1 instead.
+# Grafana is the one documented exception, controlled by GRAFANA_LAN_ACCESS in
+# the CONFIGURATION block. Binding Grafana to 0.0.0.0 in the compose file is NOT
+# sufficient on its own — without an explicit ACCEPT rule here, the blanket DROP
+# below silently blocks it. The previous version of this script had exactly that
+# mismatch: it printed "accessible on factory LAN" while denying the traffic.
 
 echo "      Applying DOCKER-USER iptables rules..."
 
-# Block all external traffic to Docker container ports by default
+# The DOCKER-USER chain is created by Docker. If the daemon has not populated it
+# yet, create it so the inserts below cannot fail under 'set -e'.
+if ! sudo iptables -n -L DOCKER-USER >/dev/null 2>&1; then
+    sudo iptables -N DOCKER-USER
+    sudo iptables -I FORWARD -j DOCKER-USER
+fi
+
+# Idempotency: strip any rules a previous run of this script left behind,
+# otherwise re-running stacks duplicates and the effective policy drifts.
+while sudo iptables -D DOCKER-USER -i "${EXTERNAL_IF}" -j DROP 2>/dev/null; do :; done
+while sudo iptables -D DOCKER-USER -i "${EXTERNAL_IF}" \
+    -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+while sudo iptables -D DOCKER-USER -i tailscale0 -j ACCEPT 2>/dev/null; do :; done
+while sudo iptables -D DOCKER-USER -i "${EXTERNAL_IF}" -p tcp \
+    --dport "${GRAFANA_PORT}" -j ACCEPT 2>/dev/null; do :; done
+
+# Rules are inserted with -I (position 1), so the LAST insert is evaluated FIRST.
+# Final evaluation order is the reverse of the order written below:
+#   1. tailscale0                      ACCEPT
+#   2. external + Grafana port         ACCEPT   (only if GRAFANA_LAN_ACCESS=true)
+#   3. external + RELATED,ESTABLISHED  ACCEPT
+#   4. external                        DROP
+
+# 4th evaluated — default deny for container ports from the LAN/internet
 sudo iptables -I DOCKER-USER -i "${EXTERNAL_IF}" -j DROP
 
-# Allow established/related connections through (responses to outbound traffic)
+# 3rd evaluated — responses to outbound container traffic
 sudo iptables -I DOCKER-USER -i "${EXTERNAL_IF}" \
     -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-# Allow all traffic arriving on the Tailscale interface to reach containers
+# 2nd evaluated — the documented Grafana exception
+if [ "${GRAFANA_LAN_ACCESS}" = "true" ]; then
+    sudo iptables -I DOCKER-USER -i "${EXTERNAL_IF}" -p tcp \
+        --dport "${GRAFANA_PORT}" -j ACCEPT
+fi
+
+# 1st evaluated — Tailscale always reaches containers
 sudo iptables -I DOCKER-USER -i tailscale0 -j ACCEPT
 
 # --- PERSIST IPTABLES RULES ---
@@ -249,7 +339,11 @@ sudo netfilter-persistent save
 
 echo "      Firewall configured."
 echo "      Container ports: accessible via Tailscale only."
-echo "      (Grafana on 0.0.0.0:3000 is accessible on factory LAN — intentional)"
+if [ "${GRAFANA_LAN_ACCESS}" = "true" ]; then
+    echo "      Grafana (port ${GRAFANA_PORT}): ALSO reachable from the factory LAN."
+else
+    echo "      Grafana (port ${GRAFANA_PORT}): Tailscale only (GRAFANA_LAN_ACCESS=false)."
+fi
 
 
 # ==============================================================================
@@ -307,9 +401,25 @@ echo "[9/11] Deploying SSH access key for mudro-admin..."
 # matching private key (kept securely by MudroLogic) can authenticate.
 sudo mkdir -p /home/mudro-admin/.ssh
 sudo chmod 700 /home/mudro-admin/.ssh
+sudo touch /home/mudro-admin/.ssh/authorized_keys
 
-# Your SSH public key — safe to be in a public repo, this is NOT a secret
-sudo bash -c 'echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... maintenance@mudrologic.com" >> /home/mudro-admin/.ssh/authorized_keys'
+# Validate the key actually parses before installing it. A malformed key is
+# accepted by the file but silently ignored by sshd, which would leave you
+# without the emergency access this whole section exists to guarantee.
+if ! printf '%s\n' "${MUDRO_SSH_PUBKEY}" | ssh-keygen -l -f - >/dev/null 2>&1; then
+    echo "ERROR: MUDRO_SSH_PUBKEY is not a valid SSH public key." >&2
+    echo "       Refusing to install it — you would be locked out." >&2
+    exit 1
+fi
+
+# Idempotent: re-running the script must not append a duplicate entry.
+if sudo grep -qF "${MUDRO_SSH_PUBKEY}" /home/mudro-admin/.ssh/authorized_keys; then
+    echo "      Key already present — skipping."
+else
+    printf '%s\n' "${MUDRO_SSH_PUBKEY}" \
+        | sudo tee -a /home/mudro-admin/.ssh/authorized_keys > /dev/null
+    echo "      Key installed."
+fi
 
 sudo chmod 600 /home/mudro-admin/.ssh/authorized_keys
 sudo chown -R mudro-admin:mudro-admin /home/mudro-admin/.ssh
@@ -327,7 +437,23 @@ echo "[10/11] Hardening SSH configuration..."
 # This prevents brute-force attacks even if a weak password exists.
 sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-sudo systemctl restart sshd
+
+# Ubuntu 22.04+ also ships drop-in configs under /etc/ssh/sshd_config.d/ which
+# are read AFTER sshd_config and would override the settings above (the cloud
+# images commonly enable password auth there).
+if [ -d /etc/ssh/sshd_config.d ]; then
+    sudo grep -rlE '^\s*(PasswordAuthentication|PermitRootLogin)' \
+        /etc/ssh/sshd_config.d/ 2>/dev/null | while read -r f; do
+        sudo sed -i 's/^\s*PasswordAuthentication.*/PasswordAuthentication no/' "$f"
+        sudo sed -i 's/^\s*PermitRootLogin.*/PermitRootLogin no/' "$f"
+    done
+fi
+
+# Validate before restarting — a bad sshd_config plus a restart locks you out.
+sudo sshd -t
+
+# The unit is 'ssh' on Debian/Ubuntu and 'sshd' on RHEL-family.
+sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd
 
 echo "      SSH hardened. Key-only access enforced."
 
@@ -371,12 +497,35 @@ echo "  ────────────────────────
 echo ""
 
 # The command is read into a variable, executed, then immediately wiped.
-# It is never written to disk or bash history.
-read -p "  Paste the full 'docker run' command, then press ENTER: " PORTAINER_CMD
+# It is not written to disk and does not enter your shell history (the script
+# reads it, not the interactive shell). It IS visible on screen as you paste —
+# the EDGE_KEY is a secret, so make sure nobody is reading over your shoulder.
+#
+# Read line-by-line until a blank line: Portainer generates a multi-line command
+# with trailing backslashes. A plain 'read' would capture only the first line,
+# and without -r it would also eat the backslashes.
+echo "  Paste the full 'docker run' command."
+echo "  Multi-line is fine — press ENTER on a BLANK line when done:"
+PORTAINER_CMD=""
+while IFS= read -r line; do
+    [ -z "${line}" ] && break
+    PORTAINER_CMD="${PORTAINER_CMD}${line}"$'\n'
+done
 echo ""
 
+# Sanity-check before eval. This does not make eval safe against a hostile
+# paste — it catches the realistic failure, which is pasting the wrong thing.
+case "${PORTAINER_CMD}" in
+    *docker*run*portainer/agent*) ;;
+    *)
+        echo "ERROR: that does not look like a Portainer agent 'docker run' command." >&2
+        echo "       Nothing was executed. Re-run this script or start the agent manually." >&2
+        exit 1
+        ;;
+esac
+
 eval "${PORTAINER_CMD}"
-unset PORTAINER_CMD
+unset PORTAINER_CMD line
 
 echo "      Portainer Edge Agent installed."
 
@@ -391,16 +540,37 @@ echo "      Portainer Edge Agent installed."
 unset TS_KEY ADMIN_PASSWORD PORTAINER_CMD TAILSCALE_IP
 
 
-# Create bind-mount dirs with correct ownership before Portainer deploys
-mkdir -p ./node-red/data
-sudo chown -R 1000:1000 ./node-red/data       # node-red runs as UID 1000
- 
-# Mosquitto runtime dirs (already bind-mounted in compose)
-mkdir -p ./mosquitto/data ./mosquitto/log
-sudo chown -R 1883:1883 ./mosquitto/data ./mosquitto/log
- 
-# Host backup directory (used by rclone backup service)
+# ==============================================================================
+# STACK BIND-MOUNT DIRECTORIES
+# The compose file uses relative bind mounts, so these must exist — with the
+# right ownership — in the directory Portainer deploys the stack into.
+#
+# The previous version created these relative to whatever directory the script
+# happened to be run from (usually the installing user's home), which is not
+# where Portainer puts the stack. Set STACK_DIR at the top of this script to
+# your actual Portainer stack path.
+#
+# Mosquitto in particular will not start at all without its config file present.
+# ==============================================================================
+echo ""
+echo "      Preparing stack directories under: ${STACK_DIR}"
+
+sudo mkdir -p "${STACK_DIR}/node-red/data"
+sudo mkdir -p "${STACK_DIR}/mosquitto/data" "${STACK_DIR}/mosquitto/log"
+
+# node-red currently runs as root in docker-compose.yml. UID 1000 matches the
+# stock node-red image user, which is what you want if that is ever changed back.
+sudo chown -R 1000:1000 "${STACK_DIR}/node-red/data"
+sudo chown -R 1883:1883 "${STACK_DIR}/mosquitto/data" "${STACK_DIR}/mosquitto/log"
+
+# Host backup directory (bind-mounted by the rclone backup service)
 sudo mkdir -p /backups
+
+echo "      Stack directories ready."
+echo ""
+echo "      NOTE: verify ${STACK_DIR} matches the path Portainer actually uses."
+echo "      If it does not, the stack's relative bind mounts will not resolve"
+echo "      and mosquitto will fail to start."
 
 
 # ==============================================================================
